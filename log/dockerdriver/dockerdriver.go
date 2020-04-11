@@ -8,13 +8,9 @@ import (
 	"net"
 	"net/http"
 	"syscall"
-	"time"
-
-	"io"
 
 	"github.com/alecthomas/repr"
 	"github.com/docker/docker/daemon/logger"
-	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/go-plugins-helpers/sdk"
 	protoio "github.com/gogo/protobuf/io"
 	"github.com/pkg/errors"
@@ -45,7 +41,7 @@ func (d *dockerDriver) startLogging(r *StartLoggingRequest) error {
 	}
 
 	// it's important to use one goroutine per container
-	go d.consumer.StartConsume(r.Info.ContainerID, r.File, f)
+	go d.consumer.StartConsume(r.Info.ContainerID, f)
 
 	return nil
 }
@@ -56,25 +52,35 @@ func (d *dockerDriver) stopLogging(r *StopLoggingRequest) error {
 	return nil
 }
 
-func (d *dockerDriver) readLogs(req *ReadLogsRequest) (io.ReadCloser, error) {
-	r, w := io.Pipe()
-
+func (d *dockerDriver) readLogs(req *ReadLogsRequest, w http.ResponseWriter) error {
 	enc := protoio.NewUint32DelimitedWriter(w, binary.BigEndian)
 
-	logs := d.consumer.ReadLogs(req.Info.ContainerID)
+	flusher := w.(http.Flusher)
+	reader := d.consumer.ReadLogs(req.Info.ContainerID)
 
-	go func() {
-		time.Sleep(time.Second * 2)
-		for _, log := range logs {
-			enc.WriteMsg(&log)
+	defer enc.Close()
+
+	for {
+		logEntry, ok := <-reader.C
+		if !ok {
+			break
 		}
-		enc.Close()
-	}()
-	return r, nil
+
+		logEntry.Line = append(logEntry.Line, '\n')
+		err := enc.WriteMsg(&logEntry)
+		if err != nil {
+			// TODO: send message to reader to stop reading
+			fmt.Printf("Failed to push logs on stream, containerID: %s, error: %s", req.Info.ContainerID, err.Error())
+			return nil
+		}
+		flusher.Flush()
+	}
+
+	return nil
 }
 
 func New() DockerDriver {
-	handler := sdk.NewHandler(`{"Implements": ["LoggingDriver", "LogDriver"]}`)
+	handler := sdk.NewHandler(`{"Implements": ["LogDriver"]}`)
 	driver := &dockerDriver{
 		handler:  &handler,
 		consumer: newLogConsumer(),
@@ -116,14 +122,12 @@ func New() DockerDriver {
 		}
 
 		w.Header().Set("Content-Type", "application/x-json-stream")
-		stream, err := driver.readLogs(&req)
+		err := driver.readLogs(&req, w)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Content-Type", "application/x-json-stream")
-		wf := ioutils.NewWriteFlusher(w)
-		io.Copy(wf, stream)
+
 	})
 	return driver
 }

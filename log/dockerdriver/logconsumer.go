@@ -2,8 +2,8 @@ package dockerdriver
 
 import (
 	"encoding/binary"
-	"fmt"
 	"io"
+	"log"
 	"sync"
 
 	"github.com/docker/docker/api/types/plugins/logdriver"
@@ -17,17 +17,18 @@ const MAX_LINES_BY_CONTAINER = 100
 // counter of lines of log
 
 type LogConsumer interface {
-	StartConsume(containerID, filePath string, buf io.ReadWriteCloser)
-	ReadLogs(containerID string) []logdriver.LogEntry
+	StartConsume(containerID string, buf io.ReadCloser)
+	ReadLogs(containerID string) *logReader
 }
 
 type ringEntry struct {
 	entry      logdriver.LogEntry
-	next, prev *ringEntry
+	prev, next *ringEntry
 }
 
 type logBuffer struct {
-	start, end *ringEntry
+	mu   sync.Mutex
+	ring *ringEntry
 }
 
 type logConsumer struct {
@@ -36,8 +37,34 @@ type logConsumer struct {
 	buffers    map[string]*logBuffer
 }
 
-func (l *logConsumer) ReadLogs(containerID string) []logdriver.LogEntry {
-	logs := make([]logdriver.LogEntry, MAX_LINES_BY_CONTAINER)
+type logReader struct {
+	buffer *logBuffer
+	C      chan logdriver.LogEntry
+}
+
+func (l *logReader) startRead() {
+	l.buffer.mu.Lock()
+	defer l.buffer.mu.Unlock()
+
+	current := l.buffer.ring.next
+	for {
+		if len(current.entry.Line) == 0 {
+			current = current.next
+			continue
+		}
+		l.C <- current.entry
+
+		current = current.next
+		if current == l.buffer.ring {
+			break
+		}
+	}
+
+	close(l.C)
+
+}
+
+func (l *logConsumer) ReadLogs(containerID string) *logReader {
 
 	l.mu.Lock()
 	buffer := l.buffers[containerID]
@@ -46,22 +73,18 @@ func (l *logConsumer) ReadLogs(containerID string) []logdriver.LogEntry {
 	if buffer == nil {
 		return nil
 	}
-	count := 0
-	for current := buffer.end; count < MAX_LINES_BY_CONTAINER; {
-		logs[count] = current.entry
-		count++
 
-		current = current.prev
-		if current == buffer.end {
-			break
-		}
+	reader := &logReader{
+		buffer: buffer,
+		C:      make(chan logdriver.LogEntry, 100),
 	}
-	return logs
+	go reader.startRead()
+
+	return reader
 }
 
-func (l *logConsumer) StartConsume(containerID, filePath string, buf io.ReadWriteCloser) {
+func (l *logConsumer) StartConsume(containerID string, buf io.ReadCloser) {
 	l.mu.Lock()
-	l.containers[containerID] = filePath
 	buffer := newLogBuffer()
 	l.buffers[containerID] = buffer
 	l.mu.Unlock()
@@ -72,18 +95,19 @@ func (l *logConsumer) StartConsume(containerID, filePath string, buf io.ReadWrit
 
 	var logEntry logdriver.LogEntry
 	for {
+		logEntry.Reset()
 		err := dec.ReadMsg(&logEntry)
 		if err == io.EOF {
 			return
+		} else if err != nil {
+			log.Printf("Failed to consume log, container ID: %s, error: %s", containerID, err.Error())
+			return
 		}
-		if err != nil {
-			fmt.Println(err)
-		}
-		buffer.end.entry = logEntry
-		buffer.end = buffer.end.next
-		buffer.start = buffer.start.next
 
-		logEntry.Reset()
+		buffer.mu.Lock()
+		buffer.ring.entry = logEntry
+		buffer.ring = buffer.ring.next
+		buffer.mu.Unlock()
 	}
 }
 
@@ -99,7 +123,7 @@ func newLogBuffer() *logBuffer {
 	start := &ringEntry{}
 	next := start
 
-	for i := 1; i < MAX_LINES_BY_CONTAINER; i++ {
+	for i := 0; i < MAX_LINES_BY_CONTAINER; i++ {
 		next.next = &ringEntry{prev: next}
 		next = next.next
 	}
@@ -107,5 +131,5 @@ func newLogBuffer() *logBuffer {
 	next.next = start
 	start.prev = next
 
-	return &logBuffer{start: next, end: start}
+	return &logBuffer{ring: next}
 }
